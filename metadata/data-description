@@ -1,0 +1,6 @@
+raw origins: 
+
+1. the script 'get-data' on data-processing/_h folder present the tools to get and structure the rlist files from raw.
+
+2. the structure of the rlist files are centered by list of data from each slice, with information from 15 cells. 
+
