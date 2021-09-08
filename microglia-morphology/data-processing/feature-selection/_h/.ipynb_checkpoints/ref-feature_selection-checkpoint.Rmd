@@ -1,0 +1,4888 @@
+---
+title: "Feature Selection"
+author: "Caio Isaias"
+date: "3/20/2021"
+output: rmdformats::readthedown
+
+---
+
+<!--
+# original theme
+  html_document:
+    toc: true
+    toc_float: true
+    
+# theme 1
+rmdformats::readthedown
+
+# theme 2
+  rmdformats::downcute:
+  self_contained: true
+  thumbnails: true
+  lightbox: true
+  gallery: true
+  highlight: tango
+  toc: true
+  toc_float: true
+
+-------------------
+    Mudanças:
+    - escolher nova paleta de cor e posição para os graficos      [ ]
+    - adicionar xlim em density plots de dificil visualização     [ ]
+
+
+------------------    
+-->
+```{r import-packages   , echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(Rmisc)
+library(car)
+library(corrplot)
+library(moments)
+library(ggbiplot)
+library(factoextra)
+library(cluster)
+library(dendextend)
+```
+```{r import-data       , echo = FALSE, message = FALSE, warning = FALSE}
+# import relevant data
+# - morphology data processed
+
+m <- "/home/caio/Documents/UFABC/Pesquisa/Resultados/measure-data.csv"
+h <- "/home/caio/Documents/UFABC/Pesquisa/Resultados/hull-data.csv"
+s <- "/home/caio/Documents/UFABC/Pesquisa/Resultados/skeleton-data.csv"
+d <- "/home/caio/Documents/UFABC/Pesquisa/Resultados/hull-diff-data.csv"
+z <- "/home/caio/Documents/UFABC/Pesquisa/Resultados/frac-data.csv"
+
+measures.data   <- read.csv(m)
+hull.data       <- read.csv(h)
+skeleton.data   <- read.csv(s)
+diff.area.data  <- read.csv(d)
+frac.data       <- read.csv(z)
+
+rm(m,h,s,d,z)
+```
+```{r integrate-dataset , echo = FALSE, message = FALSE, warning = FALSE}
+# build integrated data-frame
+
+#measure
+measures.data <- measures.data %>% filter(Grupo != "CL") %>% 
+    select(Area,Perim.,AR, Solidity,Round, Circ.)
+colnames(measures.data) <- c("Cell.Area","Cell.Perimeter","Aspect.Ratio","Solidity","Round", "Circularity")
+
+#hull
+hull.data <- hull.data %>% 
+    select(Animal,Corte,Grupo,Region,Density...Foreground.Pixels.Hull.Area,
+           Area, Diameter.of.Bounding.Circle,
+           Mean.Radius.from.Circle.s.Centre) %>% 
+    filter(Grupo != "CL")
+colnames(hull.data) <- c("Animal","Corte","Grupo","Region","Foreground.pixels.by.hull.area",
+                         "Hull.Area","Diameter.of.Bounding.Circle","Mean.Radius")
+#skeleton
+skeleton.data <- skeleton.data %>% 
+    filter(Grupo != "CL") %>%  
+    select(Branches,Junctions,End.point.voxels,Triple.points,
+           Quadruple.points,Average.branch.length, Maximum.branch.length) 
+
+#frac
+frac.data <- frac.data %>%  
+    filter(Grupo != "CL") %>% 
+    mutate_at(vars(D,D.max.r..,Lacunarity), as.numeric) %>%
+    select(D,D.max.r..,Lacunarity)
+colnames(frac.data) <- c("D","D.max","Lacunarity")
+
+#obs. add hull void area to hull.data
+diff.area.data <- diff.area.data %>%
+    filter(Grupo != "CL")
+colnames(diff.area.data) <- c("","","","","Hull.void.area")
+hull.data <- tibble(hull.data, Hull.void.area = diff.area.data$Hull.void.area)
+
+# data-frame with all data
+data <- cbind(hull.data,measures.data,skeleton.data,frac.data) 
+# rearranging Groups
+Grupos <- as.vector(data$Grupo)
+data$Grupo <- factor(Grupos, levels = c("AS","AL","CS"))
+
+#write_csv(data,"features_data.csv")
+
+rm(hull.data,measures.data,skeleton.data,frac.data,diff.area.data,Grupos)
+```
+
+```{r build-functions, echo=FALSE, message=FALSE, warning=FALSE}
+# função para avaliar correlação entre aparâmetros
+correlation <- function(x,y, a = deparse(substitute(x)), b = deparse(substitute(y))){
+    data <- as.data.frame(cbind(x,y))
+    p <- ggplot(data, aes(x,y)) + geom_point(alpha = 0.5) + geom_smooth() + 
+          xlab(a) + ylab(b)
+    c <- cor.test(x,y)
+    out <- list(c,p)
+    return(out)
+}
+
+# função para coletar a descrição de um conjunto de dados
+get.description <- function(data){
+data.description <- as.matrix(summary(data))
+data.description <- t(data.description) #horizontalize
+data.description <- cbind(data.description, Var = var(data),
+                          Sd = sd(data), N = length(data))
+return(as.data.frame(data.description))
+}
+
+# normality test & equal variance [parameters]
+norm.and.var <- function(data,parametro,region = FALSE){
+  if(region == FALSE){
+    normality <- lapply(split(data[,parametro],
+                              data[,"Grupo"]), shapiro.test)
+    grupo <- attributes(normality)$names
+    for(i in 1:3){
+      cat(paste("(Shapiro) Normalidade de ",
+            grupo[i],":",
+            deparse(normality[[i]][[2]] > 0.05),"\n"))
+    }
+    eqvar <- leveneTest(data[,parametro] ~ data$Grupo, data)
+    cat("\n")
+    print(eqvar)
+  }
+  if(region == TRUE){
+    normality <- lapply(split(data[,parametro],
+                        list(data[,"Grupo"],data[,"Region"])),
+                        shapiro.test)
+    grupo  <- rep(c("AS","AL","CS"),3)
+    region <- c(rep("CA1",3),rep("CA3",3),rep("GD",3))
+    for(i in 1:9){
+      cat(paste(" (Shapiro) Normalidade de ",
+            grupo[i],"em ",region[i],":",
+            deparse(normality[[i]][[2]] > 0.05),"\n"))    
+    }
+    #CA1
+    row.ca1 <- which(data$Region == "CA1")
+    eqvar <- leveneTest(data[row.ca1,parametro] ~ data[row.ca1,"Grupo"], data)
+    cat("\nCA1 Variance Test\n")
+    print(eqvar)
+    cat("\n")
+    #CA3
+    row.ca3 <- which(data$Region == "CA3")
+    eqvar <- leveneTest(data[row.ca3,parametro] ~ data[row.ca1,"Grupo"], data)
+    cat("CA3 Variance Test\n")
+    print(eqvar)
+    cat("\n")
+    #GD
+    row.gd <- which(data$Region == "GD")
+    eqvar <- leveneTest(data[row.gd,parametro] ~ data[row.ca1,"Grupo"], data)
+    cat("GD Variance Test\n")
+    print(eqvar)
+  }
+}
+
+# variance score
+variance.score <- function(data,parameter){
+  cs <- which(data$Grupo == "CS")
+  as <- which(data$Grupo == "AS")
+  al <- which(data$Grupo == "AL")
+  
+  d.scale <- scale(data[,parameter], center = FALSE)
+  
+  var.cs <- var(d.scale[cs])
+  var.as <- var(d.scale[as])
+  var.al <- var(d.scale[al])
+  
+  score <- abs(var.cs - var.as) + abs(var.cs - var.al)
+  return(score)
+}
+
+# check for the cumulative variance < threshold
+pc.90 <- function(data, parameters, threshold){
+  # input: 
+  #   matrix of crossed parameters
+  #   raw data
+  count = 0
+  for(i in 1:nrow(parameters)){
+  par <- t(parameters[i,])[1:ncol(parameters)]
+  par.data <- data[par]
+  
+  pca <- prcomp(par.data, center = TRUE, scale = TRUE)
+  exp.var <- pca$sdev^2 / sum(pca$sdev^2)
+  cumulative.var <- sum(exp.var[1:2])
+  if(cumulative.var >= threshold){
+    cat("# ",i, par ," #\n")
+    p <- ggbiplot(pca, choices = 1:2, alpha = 0.2, ellipse = TRUE, 
+         groups = data$Grupo) + xlim(-4,4) + ylim(-4,4) +
+         theme(legend.direction ="horizontal", legend.position = "top")+
+         guides(fill = guide_legend(title = "Grupos", title.position = "left"))+
+         ggtitle(label = paste("Exemplo ",i))
+    print(p)
+    count = count + 1
+    }
+  }
+  print(paste("Numero total de arranjos >=",threshold,":",count))
+}
+
+# checking sill for a parameters data.frame
+val.sill <- function(data,parameters, show.plot = FALSE, componentes = 1:2){
+  output <- list()
+  #erro
+  if(max(componentes) > ncol(parameters)){return(cat("Numero de componentes
+                                                     incompativel com o numero
+                                                     de parametros!\n"))}
+  
+  if(is.data.frame(parameters)){
+    for(i in 1:nrow(parameters)){
+      par   <- unlist(parameters[i,], use.names = FALSE)
+      pca   <- prcomp(data[par], center = TRUE, scale = TRUE)
+      
+      coord <- pca$x[,componentes]
+      dista <- dist(coord,method = "euclidian")
+      clust <- hclust(dista, method = "ward.D2")
+    
+      id.k3 <- as.factor(cutree(clust,k=3))
+      id.k2 <- as.factor(cutree(clust,k=2))
+    
+      #
+      #k = 3
+      sill.k3 <- silhouette(cutree(clust, k= 3), dista)
+      sill.df <- as.tibble(sill.k3[,1:3])
+      
+      sill.mean <- sill.df %>% 
+        group_by(cluster) %>% summarise(silhoutte.mean = mean(sil_width))
+      
+      nª.negative = c(length(which(sill.df$sil_width < 0 & sill.df$cluster == 1)),
+                      length(which(sill.df$sil_width < 0 & sill.df$cluster == 2)),
+                      length(which(sill.df$sil_width < 0 & sill.df$cluster == 3)))
+      sill.info <- cbind(sill.mean,nª.negative)
+      negative.percent <- sum(sill.info$nª.negative/nrow(sill.df))
+      
+      k3.info <- list(info = sill.info, negative = negative.percent, mean = mean(sill.info$silhoutte.mean))
+           
+      #k = 2              
+      sill.k2 <- silhouette(cutree(clust, k= 2), dista)
+      sill.df <- as.tibble(sill.k2[,1:3])
+      
+      sill.mean <- sill.df %>% 
+        group_by(cluster) %>% summarise(silhoutte.mean = mean(sil_width))
+      
+      nª.negative = c(length(which(sill.df$sil_width < 0 & sill.df$cluster == 1)),
+                      length(which(sill.df$sil_width < 0 & sill.df$cluster == 2)))
+      sill.info <- cbind(sill.mean,nª.negative)
+      negative.percent <- sum(sill.info$nª.negative/nrow(sill.df))
+      
+      k2.info <- list(info = sill.info, negative = negative.percent, mean = mean(sill.info$silhoutte.mean))
+      
+      if(show.plot){
+      p.k3 <- ggbiplot(pca, choices = 1:2, alpha = 0.1, ellipse = TRUE, 
+              groups = id.k3) + scale_color_manual(name="Cluster", 
+              values=c("#0072B2","#CC6666","#66CC99")) +
+              theme(legend.direction ="horizontal", legend.position = "top")
+      p.k2 <- ggbiplot(pca, choices = 1:2, alpha = 0.1, ellipse = TRUE, 
+              groups = id.k2) + scale_color_manual(name="Cluster", 
+              values=c("#0072B2","#CC6666","#66CC99")) +
+              theme(legend.direction ="horizontal", legend.position = "top")
+     
+      p.s3 <- fviz_silhouette(silhouette(cutree(clust, k= 3),dista),
+              palette = c("#0072B2","#CC6666","#66CC99"))+
+              theme(plot.title = element_text(hjust = 0.5))
+      p.s2 <- fviz_silhouette(silhouette(cutree(clust, k= 2),dista),
+              palette = c("#0072B2","#CC6666","#66CC99"))+
+              theme(plot.title = element_text(hjust = 0.5))
+      p <- list(p.k3,p.s3,p.k2,p.s2)
+      
+      output[[i]] <- list(plots = p, k2 = k2.info, k3 = k3.info)
+      }
+      else{
+      output[[i]] <- list(k2 = k2.info, k3 = k3.info)
+      }
+    }
+    
+  } else(cat("Parameters structure invalid: data.frame only\n"))
+
+return(output)
+} 
+
+# check for the higher silhoutte mean
+max.sill <- function(sill.validation, plot = TRUE){
+  # mean sill results in a vector
+  k2 <- vector(mode = "numeric", length = length(sill.validation))
+  k3 <- vector(mode = "numeric", length = length(sill.validation))
+  for(i in 1:length(k2)){k2[i] <- sill.validation[[i]]$k2$mean}
+  for(i in 1:length(k3)){k3[i] <- sill.validation[[i]]$k3$mean}
+  
+  if(plot){
+    #k = 2
+    k2.ps   <- sill.validation[[which(k2 == max(k2))]]$plot[4]
+    k2.pc   <- sill.validation[[which(k2 == max(k2))]]$plot[3]
+    k2.info <- sill.validation[[which(k2 == max(k2))]]$k2
+    #k = 3
+    k3.ps   <- sill.validation[[which(k3 == max(k3))]]$plot[2]
+    k3.pc   <- sill.validation[[which(k3 == max(k3))]]$plot[1]
+    k3.info <- sill.validation[[which(k3 == max(k3))]]$k3
+    
+    
+    plot    <- list(k2 = list(k2.ps,k2.pc),k3 = list(k3.ps,k3.pc))
+    info    <- list(k2 = k2.info, k3 = k3.info)
+    id      <- list(k2 = which(k2 == max(k2)),k3 = which(k3 == max(k3)) )
+    outcome <- list(plot = plot, info = info, id = id)
+  }
+  else{
+    k2.info <- sill.validation[[which(k2 == max(k2))]]$k2
+    k3.info <- sill.validation[[which(k3 == max(k3))]]$k3
+    info    <- list(k2 = k2.info, k3 = k3.info)
+    id      <- list(k2 = which(k2 == max(k2)),k3 = which(k3 == max(k3)) )
+    outcome <- list(info = info, id = id)
+  }
+  return(outcome)
+}
+
+# MMI
+mmi_fun <- function(data){
+  ((skewness(data)^2)+1)/((kurtosis(data)+3*((length(data)-1)^2))/(length(data)-2)*(length(data)-3))
+}
+```
+
+O objetivo deste documento é explorar os parâmetros analisados, avaliando quais deles serão relevantes para a descrição da morfologia microglial, de modo que selecionemos aqueles que melhor performarão a *clusterização* das células.
+
+#### Tabela de parâmetros
+```{r parameter-table, echo = FALSE, message = FALSE, warning = FALSE}
+par.names       <- c("Foreground Pixel/Hull Area","Hull Area",
+                     "Diameter of Bounding Circle","Mean Radius",
+                     "Circularity","Hull Void Area","Cell Area",
+                     "Cell Perimeter","Aspect Ratio","Solidity",
+                     "Round","Branches", "Junctions", "Triple Points",
+                     "Quadruple Points", "Endpoints", "Average Branch Length",
+                     "Maximum Branch Length", "D (Fractal Dimension)",
+                     "Lacunarity") # without D.max
+par.description <- c("Densidade de pixeis dentro da área do Hull",
+                     "Área do hull, delimitada pela ligação das extremidades da célula",
+                     "Diametro do circulo que circunscreve a célula",
+                     "Média do raios que partem do centro da célula para cada uma das extremidades do hull",
+                     "Quão proximo a forma da célula esta de se encaixar sob um circulo perfeito",
+                     "Area dentro do hull que não esta preenchida por pixeis da célula",
+                     "Área da célula",
+                     "Permetro da célula",
+                     "Razão das dimensões altura e largura da célula",
+                     "Area da célula/Area do Hull -  similar a medida de densidade, mas sob um algoritmo diferente",
+                     "Similar a circularidade, mas é uma metrica corrigida pelo AR. Descreve o quanto a superficie da célula não é 'acidentada'",
+                     "Numero de ramificações na célula",
+                     "Numero de pontos onde ao menos 3 ramificações se unem",
+                     "Numero de pontos onde 3 ramificações se unem",
+                     "Numero de pontos onde 4 ramificações se unem",
+                     "Numero de extremidades uma célula tem quando visualizada 'esqueletonizada'",
+                     "Comprimento médio das ramificações da célula",
+                     "Comprimento máximo das ramificações da célula",
+                     "Dimensão fractal da célula, descreve a complexidade da célula",
+                     "É um complemento a dimensão fractal da célula e representa a 'textura' do fractal de acordo com suas lacunas")
+
+par.table       <- tibble(parâmetros = par.names, Descrição = par.description)
+knitr::kable(par.table)
+rm(par.table,par.description,par.names)
+```
+
+
+# Analise de parâmetros
+
+A analise dos parâmetros seguiu o seguinte *pipeline*: 
+
+(1) **Descrição estatística dos dados**, em tabelas, para os diferentes grupos experimentais e regiões trabalhadas. Foram utilizados as funções `summary()`,`var()` e `sd()`. 
+
+(2) **Visualização da distribuição dos dados** através do *density plot* e *box plot*. Foi utilizado o `ggplot()`. 
+
+(3) **Cálculo das médias** por animal para as analises estatisticas, tanto para o hipocampo inteiro como tabém para suas diferentes regiões. Foram montadas as tabelas com auxilio da função `Rmisc::summarySE()`. 
+
+(4) **Verificação da normalidade na distribuição das médias e igualdade de suas variâncias** para a escolha de um teste estatistico. Foram utilizadas as funções `shapiro.test()` e `leveneTest()`, para sua avaliação, respectivamente. 
+
+(5) **Realização de testes estatísticos** para 3 configurações distintas: 
+
+[I] Conjuntos de dados **normal** e com **variância igual** entre grupos experimentais - ANOVA com *Tukey Honest Significant Differences* para multipla comparação entre médias. Foram utilizadas as funções `aov()` e `TukeyHSD()`.
+
+[II] Conjuntos de dados **normal**, mas com **variâncias diferentes** entre grupos exeperimentais - Teste-t *Welch* para multiplos grupos. Foi utilizada a função `pairwise.t.test(...,pool.sd = FALSE, p.adjust.method = "none")`.
+
+[III] Conjuntos de dados **não-normal**, mas com **variância igual** entre grupos experimentais - *Wilcoxon Rank Sum Tests* para multiplos grupos. Foi utilizada a função `pairwise.wilcox.test(..., p.adjust.method = "none")`.
+
+*Obs. para os dados não-normais que possuem diferenças nas variâncias entre grupos experimentais não foi encontrado teste estatístico satisfatório.*
+
+<!-- -->
+## Foreground pixels/Hull area {.tabset}
+
+- Distribuição dos dados de *AL* e *AS* interessante em **CA3** (*Density Plot*)
+- **Pequena diferença estatística em CA3** na comparação das médias dos animais de **CS vs. AL (p = 0.0499)**
+
+*obs. diferença para o p não ajustado para multiplas comparações*
+
+### Descrição dos dados 
+#### Hipocampo Inteiro
+
+```{r description-table-h1, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Foreground.pixels.by.hull.area)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h1,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Foreground.pixels.by.hull.area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Foreground pixels/Hull area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Foreground.pixels.by.hull.area, fill = Grupo)) +
+    geom_boxplot() + ylab("Foreground pixels/Hull area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r1, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Foreground.pixels.by.hull.area)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+
+```
+
+```{r data-visualization-r1,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Foreground.pixels.by.hull.area, fill = Grupo)) +
+    geom_boxplot() + ylab("Foreground pixels/Hull area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Foreground.pixels.by.hull.area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Foreground pixels/Hull area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+
+```
+
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab1, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Foreground.pixels.by.hull.area) %>% 
+  summarySE(measurevar = "Foreground.pixels.by.hull.area",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h1, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+
+**Regiões**
+```{r animals-stats-tab2, echo = FALSE, message = FALSE, collapse = TRUE}
+
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Foreground.pixels.by.hull.area) %>% 
+  summarySE(measurevar = "Foreground.pixels.by.hull.area",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci")
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,3,3,3,3,3,3))
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r1, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+# CA3 *unequal variance*
+# pairwise t test 
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD
+# One way anova
+cat("\nGD ANOVA\n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h1, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Foreground.pixels.by.hull.area")
+```
+
+**Regiões**
+```{r cell-stats-r1, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Foreground.pixels.by.hull.area", region = TRUE)
+```
+
+
+<!-- -->
+## Hull Area {.tabset} 
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferenças significativas em CA3** comparando as médias entre os animais. Tanto na comparação entre **CS vs. AL (p < 0.001)** como também na comparação **CS vs. AS (p < 0.05)**!
+
+*obs. é necessaria uma discussão a respeito da heterogeneidade das variâncias, e desvio, entre os grupos experimentais e como isso impacta a escolha dos testes estatisticos.*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h2, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Hull.Area)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h2,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Hull.Area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Hull Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Hull.Area, fill = Grupo)) +
+    geom_boxplot() + ylab("Hull Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r2, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Hull.Area)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r2,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Hull.Area, fill = Grupo)) +
+    geom_boxplot() + ylab("Hull Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Hull.Area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Hull Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab3, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Hull.Area) %>% 
+  summarySE(measurevar = "Hull.Area",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,3,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h2, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance NOT OK!
+
+# pairwise t test 
+cat("\nPairwise t-test for unenqual variance \n")
+
+pairwise.t.test(stats.h$Mean, stats.h$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab4, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Hull.Area) %>% 
+  summarySE(measurevar = "Hull.Area",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r2, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+stats <- aov(Mean ~ Grupo, data = stats.r)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+
+rm(stats.r,stats.temp,stats)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h2, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Hull.Area")
+```
+
+**Regiões**
+```{r cells-stats-r2, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Hull.Area", region = TRUE)
+```
+
+<!-- -->
+## Diameter of Bounding Circle {.tabset}
+
+*(Resultados semelhantes aqueles de Hull Area)*
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferenças significativas em CA3** comparando as médias entre os animais. Tanto na comparação entre **CS vs. AL (p < 0.01)** como também na comparação **CS vs. AS (p < 0.05)**!
+
+*obs. é necessaria uma discussão a respeito da heterogeneidade das variâncias, e desvio, entre os grupos experimentais e como isso impacta a escolha dos testes estatisticos.*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h3, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Diameter.of.Bounding.Circle)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h3,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Diameter.of.Bounding.Circle, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Diameter of Bounding Circle") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Diameter.of.Bounding.Circle, fill = Grupo)) +
+    geom_boxplot() + ylab("Diameter of Bounding Circle") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r3, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Diameter.of.Bounding.Circle)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r3,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Diameter.of.Bounding.Circle, fill = Grupo)) +
+    geom_boxplot() + ylab("Diameter of Bounding Circle") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Diameter.of.Bounding.Circle, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Diameter of Bounding Circle") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab5, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Diameter.of.Bounding.Circle) %>% 
+  summarySE(measurevar = "Diameter.of.Bounding.Circle",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,3,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h3, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+#anova(lm(Mean ~ Grupo, data = stats.h))
+stats <- aov(Mean ~ Grupo, data = stats.h)
+TukeyHSD(stats)
+
+rm(stats.h,stats)
+```
+
+**Regiões**
+```{r animals-stats-tab6, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Diameter.of.Bounding.Circle) %>% 
+  summarySE(measurevar = "Diameter.of.Bounding.Circle",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r3, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+stats <- aov(Mean ~ Grupo, data = stats.r)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD - Não normal e com variância diferente!
+     \n (Sem teste estatistico adequado)\n")
+
+
+#rm(stats.r,stats.temp,stats)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h3, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Diameter.of.Bounding.Circle")
+```
+
+**Regiões**
+```{r cells-stats-r3, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Diameter.of.Bounding.Circle", region = TRUE)
+```
+
+
+<!-- -->
+## Mean Radius {.tabset}
+
+*(Resultados semelhantes aqueles de Hull Area & Diameter of Bounding Circle)*
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferenças significativas em CA3** comparando as médias entre os animais. Tanto na comparação entre **CS vs. AL (p < 0.01)** como também na comparação **CS vs. AS (p < 0.05)**!
+
+*obs. é necessaria uma discussão a respeito da heterogeneidade das variâncias, e desvio, entre os grupos experimentais e como isso impacta a escolha dos testes estatisticos.*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h4, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Mean.Radius)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h4,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Mean.Radius, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Mean Radius") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Mean.Radius, fill = Grupo)) +
+    geom_boxplot() + ylab("Mean Radius") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r4, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Mean.Radius)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r4,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Mean.Radius, fill = Grupo)) +
+    geom_boxplot() + ylab("Mean Radius") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Mean.Radius, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Mean Radius") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab7, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Mean.Radius) %>% 
+  summarySE(measurevar = "Mean.Radius",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h4, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+#anova(lm(Mean ~ Grupo, data = stats.h))
+stats <- aov(Mean ~ Grupo, data = stats.h)
+TukeyHSD(stats)
+
+rm(stats.h,stats)
+```
+
+**Regiões**
+```{r animals-stats-tab8, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Mean.Radius) %>% 
+  summarySE(measurevar = "Mean.Radius",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r4, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+stats <- aov(Mean ~ Grupo, data = stats.r)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+
+rm(stats.r,stats.temp,stats)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h4, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Mean.Radius")
+```
+
+**Regiões**
+```{r cells-stats-r4, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Mean.Radius", region = TRUE)
+```
+
+<!-- -->
+## Circularity {.tabset}
+
+- Distribuição dos dados de *AL* interessante em **CA3**, contrastando com sua distribuição em CA1 (*Density Plot*)
+- **Diferença estatística em CA3** na comparação das médias dos animais de **CS vs. AL (p < 0.05)**
+
+*obs. diferença para o p não ajustado para multiplas comparações*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h5, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Circularity)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h5,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Circularity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Mean Radius") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Circularity, fill = Grupo)) +
+    geom_boxplot() + ylab("Mean Radius") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r5, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Circularity)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r5,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Circularity, fill = Grupo)) +
+    geom_boxplot() + ylab("Circularity") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Circularity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Circularity") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab9, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Circularity) %>% 
+  summarySE(measurevar = "Circularity",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h5, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab10, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Circularity) %>% 
+  summarySE(measurevar = "Circularity",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r5, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+# CA3
+# One way anova
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h5, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Circularity")
+```
+
+**Regiões**
+```{r cells-stats-r5, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Circularity", region = TRUE)
+```
+
+
+<!-- -->
+## Hull void Area {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**. (diferença bem robusta)
+- **Diferença significativa em CA3** comparando as médias entre os animais em **CS vs. AL (p < 0.05)** 
+
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h6, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Hull.void.area)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h6,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Hull.void.area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Hull void Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Hull.void.area, fill = Grupo)) +
+    geom_boxplot() + ylab("Hull void Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r6, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Hull.void.area)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r6,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Hull.void.area, fill = Grupo)) +
+    geom_boxplot() + ylab("Hull void Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Hull.void.area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Hull void Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab11, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Hull.void.area) %>% 
+  summarySE(measurevar = "Hull.void.area",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h6, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance NOT OK!
+
+# pairwise t test 
+cat("\nPairwise t-test for unenqual variance \n")
+
+pairwise.t.test(stats.h$Mean, stats.h$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab12, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Hull.void.area) %>% 
+  summarySE(measurevar = "Hull.void.area",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r6, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h6, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Hull.void.area")
+```
+
+**Regiões**
+```{r cells-stats-r6, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Hull.void.area", region = TRUE)
+```
+
+
+<!-- -->
+## Cell Area {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** comparando as médias entre os animais em **CS vs. AL (p < 0.01)** 
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h7, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Cell.Area)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h7,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Cell.Area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Cell Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Cell.Area, fill = Grupo)) +
+    geom_boxplot() + ylab("Cell Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r7, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Cell.Area)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r7,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Cell.Area, fill = Grupo)) +
+    geom_boxplot() + ylab("Cell Area") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Cell.Area, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Cell Area") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab13, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Cell.Area) %>% 
+  summarySE(measurevar = "Cell.Area",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h7, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+#anova(lm(Mean ~ Grupo, data = stats.h))
+stats <- aov(Mean ~ Grupo, data = stats.h)
+TukeyHSD(stats)
+
+rm(stats.h,stats)
+```
+
+**Regiões**
+```{r animals-stats-tab14, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Cell.Area) %>% 
+  summarySE(measurevar = "Cell.Area",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r7, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h7, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Cell.Area")
+```
+
+**Regiões**
+```{r cells-stats-r7, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Cell.Area", region = TRUE)
+```
+
+
+<!-- -->
+## Cell Perimeter {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** comparando as médias entre os animais em **CS vs. AL (p < 0.05)** 
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h8, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Cell.Perimeter)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h8,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Cell.Perimeter, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Cell Perimeter") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Cell.Perimeter, fill = Grupo)) +
+    geom_boxplot() + ylab("Cell Perimeter") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r8, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Cell.Perimeter)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r8,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Cell.Perimeter, fill = Grupo)) +
+    geom_boxplot() + ylab("Cell Perimeter") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Cell.Perimeter, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Cell Perimeter") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab15, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Cell.Perimeter) %>% 
+  summarySE(measurevar = "Cell.Perimeter",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h8, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance NOT OK!
+
+# pairwise t test 
+cat("\nPairwise t-test for unenqual variance \n")
+
+pairwise.t.test(stats.h$Mean, stats.h$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab16, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Cell.Perimeter) %>% 
+  summarySE(measurevar = "Cell.Perimeter",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r8, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD *unequal variance*
+# pairwise t test 
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h8, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Cell.Perimeter")
+```
+
+**Regiões**
+```{r cells-stats-r8, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Cell.Perimeter", region = TRUE)
+```
+
+
+<!-- -->
+## Aspect Ratio {.tabset}
+
+- Pequenas diferenças na variancia entre os grupos experimentais
+- **Pequena diferença em CA3**, curiosamente comparando as médias entre os animais em **CS vs. AS (p = 0.05)**
+
+*obs. diferença para o p não ajustado para multiplas comparações*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h9, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Aspect.Ratio)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h9,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Aspect.Ratio, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Aspect Ratio") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Aspect.Ratio, fill = Grupo)) +
+    geom_boxplot() + ylab("Aspect Ratio") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r9, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Aspect.Ratio)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r9,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Aspect.Ratio, fill = Grupo)) +
+    geom_boxplot() + ylab("Aspect Ratio") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Aspect.Ratio, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Aspect Ratio") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab17, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Aspect.Ratio) %>% 
+  summarySE(measurevar = "Aspect.Ratio",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h9, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab18, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Aspect.Ratio) %>% 
+  summarySE(measurevar = "Aspect.Ratio",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r9, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3 *unequal variance*
+# One way anova
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD *não normal*
+# Wilcox Rank of Sums - test nao parametrico
+cat("\nGD Não normal! \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+#wilcox.test(stats.temp$Mean)
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h9, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Aspect.Ratio")
+```
+
+**Regiões**
+```{r cells-stats-r9, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Aspect.Ratio", region = TRUE)
+```
+
+
+<!-- -->
+
+<!-- -->
+## Solidity {.tabset}
+
+- Parametro semelhante ao *Foreground pixels/Hull area*
+- **Diferença significativa em CA3** na comparação das médias dos animais de **CS vs. AL (p < 0.05)**
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h10, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Solidity)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h10,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Solidity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Solidity") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Solidity, fill = Grupo)) +
+    geom_boxplot() + ylab("Solidity") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r10, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Solidity)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r10,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Solidity, fill = Grupo)) +
+    geom_boxplot() + ylab("Solidity") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Solidity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Solidity") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab19, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Solidity) %>% 
+  summarySE(measurevar = "Solidity",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h10, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab20, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Solidity) %>% 
+  summarySE(measurevar = "Solidity",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r10, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD
+# One way anova
+cat("\nGD ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp))
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h10, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Solidity")
+```
+
+**Regiões**
+```{r cells-stats-r10, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Solidity", region = TRUE)
+```
+
+<!-- -->
+## Round {.tabset}
+
+
+- **Pequena diferença em CA3**, comparando as médias entre os animais em **AS vs. AL (p < 0.05)**
+
+*obs. diferença para o p não ajustado para multiplas comparações. *
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h11, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Round)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h11,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Round, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Round") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Round, fill = Grupo)) +
+    geom_boxplot() + ylab("Round") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r11, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Round)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r11,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Round, fill = Grupo)) +
+    geom_boxplot() + ylab("Round") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Round, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Round") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab21, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Round) %>% 
+  summarySE(measurevar = "Round",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h11, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Not NORMAL!
+
+# Pairwise Wilcoxon Rank Sum Tests
+pairwise.wilcox.test(stats.h$Mean, stats.h$Grupo, p.adjust.method = "none")
+
+rm(stats.h)
+
+```
+
+**Regiões**
+```{r animals-stats-tab22, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Round) %>% 
+  summarySE(measurevar = "Round",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r11, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp))
+
+# CA3
+# Pairwise Wilcoxon Rank Sum Tests
+cat("\nCA3 - Wilcox Test\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.wilcox.test(stats.temp$Mean, stats.temp$Grupo,
+                     p.adjust.method = "none")
+
+# GD
+# One way anova
+cat("\nGD ANOVA\n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp))
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h11, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Round")
+```
+
+**Regiões**
+```{r cells-stats-r11, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Round", region = TRUE)
+```
+<!-- -->
+## Branches {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** curiosamente somente entre **AS vs. AL (p < 0.01)**
+
+*Obs. Animal CS2 é o motivo pelo qual não é possivel garantir diferenças em CS vs. AL (p = 0.067)*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h12, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Branches)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h12,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Branches, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Branches") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Branches, fill = Grupo)) +
+    geom_boxplot() + ylab("Branches") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r12, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Branches)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r12,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Branches, fill = Grupo)) +
+    geom_boxplot() + ylab("Branches") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Branches, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Branches") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab23, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Branches) %>% 
+  summarySE(measurevar = "Branches",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h12, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab24, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Branches) %>% 
+  summarySE(measurevar = "Branches",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r12, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD
+# One way anova
+cat("\nGD ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h12, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Round")
+```
+
+**Regiões**
+```{r cells-stats-r12, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Round", region = TRUE)
+```
+
+<!-- -->
+## Junctions {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** curiosamente somente entre **AS vs. AL (p < 0.01)**
+
+*Obs. Animal CS2 é o motivo pelo qual não é possivel garantir diferenças em CS vs. AL (p = 0.060)*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h13, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Junctions)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h13,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Junctions, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Junctions") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Junctions, fill = Grupo)) +
+    geom_boxplot() + ylab("Junctions") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r13, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Junctions)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r13,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Junctions, fill = Grupo)) +
+    geom_boxplot() + ylab("Junctions") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Junctions, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Junctions") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab25, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Junctions) %>% 
+  summarySE(measurevar = "Junctions",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h13, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab26, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Junctions) %>% 
+  summarySE(measurevar = "Junctions",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r13, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD
+# One way anova
+cat("\nGD ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h13, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Junctions")
+```
+
+**Regiões**
+```{r cells-stats-r13, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Junctions", region = TRUE)
+```
+
+<!-- -->
+## Triple Points {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** curiosamente somente entre **AS vs. AL (p < 0.01)**
+
+*Obs. Animal CS2 é o motivo pelo qual não é possivel garantir diferenças em CS vs. AL (p = 0.056)*
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h14, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Triple.points)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h14,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Triple.points, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Triple Points") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Triple.points, fill = Grupo)) +
+    geom_boxplot() + ylab("Triple Points") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r14, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Triple.points)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r14,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Triple.points, fill = Grupo)) +
+    geom_boxplot() + ylab("Triple Points") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Triple.points, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Triple Points") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab27, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Triple.points) %>% 
+  summarySE(measurevar = "Triple.points",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h14, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab28, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Triple.points) %>% 
+  summarySE(measurevar = "Triple.points",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r14, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+cat("\nCA3 Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+# GD
+# One way anova
+cat("\nGD ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+#anova(lm(Mean ~ Grupo, data = stats.temp))
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h14, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Triple.points")
+```
+
+**Regiões**
+```{r cells-stats-r14, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Triple.points", region = TRUE)
+```
+
+<!-- -->
+
+
+## Quadruple Points {.tabset}
+
+- nada relevante
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h15, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Quadruple.points)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h15,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Quadruple.points, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Quadruple points") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Quadruple.points, fill = Grupo)) +
+    geom_boxplot() + ylab("Quadruple points") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r15, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Quadruple.points)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r15,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Quadruple.points, fill = Grupo)) +
+    geom_boxplot() + ylab("Quadruple points") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Quadruple.points, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Quadruple points") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab29, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Quadruple.points) %>% 
+  summarySE(measurevar = "Quadruple.points",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h15, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab30, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Quadruple.points) %>% 
+  summarySE(measurevar = "Quadruple.points",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r15, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# One way anova
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# GD
+# One way anova
+cat("\nGD ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h15, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Quadruple.points")
+```
+
+**Regiões**
+```{r cells-stats-r15, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Quadruple.points", region = TRUE)
+```
+
+<!-- -->
+## Endpoints {.tabset}
+
+- **Diferenças entre as variâncias dos grupos experimentais.** Diminuição proporcional com a quantidade de estimulos. Menor variância em *AS* e *AL* potencialmente é informativa a respeito da **tendência para a ativação microglial**.
+- **Diferença significativa em CA3** entre as médias de **CS vs. AL (p < 0.05)**
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h16, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(End.point.voxels)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h16,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(End.point.voxels, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Endpoints") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = End.point.voxels, fill = Grupo)) +
+    geom_boxplot() + ylab("Endpoints") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r16, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(End.point.voxels)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r16,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = End.point.voxels, fill = Grupo)) +
+    geom_boxplot() + ylab("Endpoints") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(End.point.voxels, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Endpoints") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab31, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,End.point.voxels) %>% 
+  summarySE(measurevar = "End.point.voxels",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h16, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance NOT OK!
+
+# pairwise t test 
+cat("\nPairwise t-test for unenqual variance \n")
+
+pairwise.t.test(stats.h$Mean, stats.h$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab32, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,End.point.voxels) %>% 
+  summarySE(measurevar = "End.point.voxels",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r16, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+cat("\nCA3 ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+# anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD
+# Pairwise t-test
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h16, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "End.point.voxels")
+```
+
+**Regiões**
+```{r cells-stats-r16, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "End.point.voxels", region = TRUE)
+```
+
+<!-- -->
+## Average Branch Length {.tabset}
+
+- Nada relevante
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h17, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Average.branch.length)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h17,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Average.branch.length, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Average branch length") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Average.branch.length, fill = Grupo)) +
+    geom_boxplot() + ylab("Average branch length") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r17, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Average.branch.length)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r17,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Average.branch.length, fill = Grupo)) +
+    geom_boxplot() + ylab("Average branch length") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Average.branch.length, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Average branch length") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab33, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Average.branch.length) %>% 
+  summarySE(measurevar = "Average.branch.length",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h17, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab34, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Average.branch.length) %>% 
+  summarySE(measurevar = "Average.branch.length",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r17, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1 - TESTE NAO PARAMETRICO
+# Pairwise t-test
+cat("\nCA1 Pairwise Wilcoxon Rank Sum Tests\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+pairwise.wilcox.test(stats.temp$Mean, stats.temp$Grupo, p.adjust.method = "none")
+
+# CA3
+# One way anova
+cat("\nCA3 ANOVA - Tukey Honest Significant Differences\n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+#anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+stats <- aov(Mean ~ Grupo, data = stats.temp)
+TukeyHSD(stats)
+
+# GD
+# One way anova
+cat("\nGD ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+#stats <- aov(Mean ~ Grupo, data = stats.temp)
+#TukeyHSD(stats)
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h17, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Average.branch.length")
+```
+
+**Regiões**
+```{r cells-stats-r17, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Average.branch.length", region = TRUE)
+```
+
+<!-- -->
+## Maximum Branch Length {.tabset}
+
+- Nada relevante
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h18, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Maximum.branch.length)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h18,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Maximum.branch.length, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Maximum branch length") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Maximum.branch.length, fill = Grupo)) +
+    geom_boxplot() + ylab("Maximum branch length") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r18, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Maximum.branch.length)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r18,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Maximum.branch.length, fill = Grupo)) +
+    geom_boxplot() + ylab("Maximum branch length") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Maximum.branch.length, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Maximum branch length") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab35, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Maximum.branch.length) %>% 
+  summarySE(measurevar = "Maximum.branch.length",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h18, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab36, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Maximum.branch.length) %>% 
+  summarySE(measurevar = "Maximum.branch.length",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r18, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+cat("\nCA3 ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# GD
+# Pairwise t-test
+cat("\nGD Pairwise t-test for unenqual variance \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+pairwise.t.test(stats.temp$Mean, stats.temp$Grupo, pool.sd = FALSE, p.adjust.method = "none")
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h18, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Maximum.branch.length")
+```
+
+**Regiões**
+```{r cells-stats-r18, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Maximum.branch.length", region = TRUE)
+```
+
+<!-- -->
+## D (Fractal Dimension) {.tabset}
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h19, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(D)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h19,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(D, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("D") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = D, fill = Grupo)) +
+    geom_boxplot() + ylab("D") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r19, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(D)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r19,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = D, fill = Grupo)) +
+    geom_boxplot() + ylab("D") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(D, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("D") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab37, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,D) %>% 
+  summarySE(measurevar = "D",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h19, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab38, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,D) %>% 
+  summarySE(measurevar = "D",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r19, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise Wilcoxon Rank Sum Tests
+cat("\nCA3 Pairwise Wilcoxon Rank Sum Tests \n")
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+pairwise.wilcox.test(stats.temp$Mean, stats.temp$Grupo, p.adjust.method = "none")
+
+# GD
+# Pairwise t-test
+cat("\nGD ANOVA \n")
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h19, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "D")
+```
+
+**Regiões**
+```{r cells-stats-r19, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "D", region = TRUE)
+```
+
+<!-- -->
+## Lacunarity {.tabset}
+
+- Distribuição dos dados de *AL* e *CS* interessante em **CA3** (*Density Plot*)
+
+### Descrição dos dados
+#### Hipocampo Inteiro
+
+```{r description-table-h20, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+
+for(i in groups){
+    temp.data <- data %>% 
+        filter(Grupo == i) %>% 
+        select(Lacunarity)
+
+    if(i == "CS"){
+        data.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+    }
+    else{
+        temp.description <- cbind(Grupo = i, get.description(temp.data[,1]))
+        data.description <- rbind(data.description, temp.description)
+    }
+}
+
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,i)
+```
+
+```{r data-visualization-h20,echo = FALSE, fig.show= "hold", out.width = "50%", fig.width = 4, fig.height = 4}
+# HIPOCAMPO
+# density plot
+data %>% 
+    ggplot(aes(Lacunarity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Lacunarity") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+# box plot
+data %>% 
+    ggplot(aes(x = Grupo, y = Lacunarity, fill = Grupo)) +
+    geom_boxplot() + ylab("Lacunarity") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top")
+```
+
+#### Regiões
+
+```{r description-table-r20, echo = FALSE, message = FALSE}
+groups <- c("CS","AS","AL")
+regions <- c("CA1","CA3","GD")
+
+for(g in groups){
+    for(r in regions){
+        temp.data <- data %>% 
+        filter(Grupo == g & Region == r) %>% 
+        select(Lacunarity)
+
+        if(g == "CS" & r == "CA1"){
+            data.description <- cbind(Grupo = g, Região = r,
+                                      get.description(temp.data[,1]))
+        }
+        else{
+            temp.description <- cbind(Grupo = g, Região = r,
+                                  get.description(temp.data[,1]))
+            data.description <- rbind(data.description, temp.description)
+        }
+    }
+}
+knitr::kable(data.description, align = "c",digits = c(0,3,3,3,3,3,3,3,3,3))
+rm(data.description,groups,regions,g,r)
+```
+
+```{r data-visualization-r20,echo = FALSE}
+# REGIÕES
+# box plot
+data %>%
+    ggplot(aes(x = Grupo, y = Lacunarity, fill = Grupo)) +
+    geom_boxplot() + ylab("Lacunarity") + xlab(NULL) +
+    ggtitle(label = "Box plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+# density plot
+data %>%
+    ggplot(aes(Lacunarity, fill = Grupo)) +
+    geom_density(alpha = 0.5) + xlab("Lacunarity") +
+    ggtitle(label = "Density plot") +
+    theme(legend.direction ="horizontal", legend.position = "top") +
+    facet_grid(~Region)
+```
+
+
+### Estatística {.tabset .tabset-fade .tabset-pills}
+
+#### Animals (N)
+**Hipocampo Inteiro**
+```{r animals-stats-tab39, echo = FALSE, message = FALSE, collapse =  TRUE}
+stats.h <- data %>% 
+  select(Animal,Grupo,Region,Lacunarity) %>% 
+  summarySE(measurevar = "Lacunarity",
+            groupvars = c("Grupo","Animal"))
+colnames(stats.h) <- c("Grupo","Animal","N","Mean","sd","se","ci") 
+
+# table
+knitr::kable(stats.h, align = "c",digits = c(0,0,3,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.h, "Mean")
+```
+
+**Teste estatístico para todo o hipocampo**
+```{r animals-stats-h20, echo = FALSE, collapse = TRUE}
+# statistical test data
+# Normality OK e Equal Variance OK!
+
+# One way anova
+anova(lm(Mean ~ Grupo, data = stats.h))
+#stats <- aov(Mean ~ Grupo, data = stats.h)
+#TukeyHSD(stats)
+
+rm(stats.h)
+```
+
+**Regiões**
+```{r animals-stats-tab40, echo = FALSE, message = FALSE, collapse = TRUE}
+stats.r <- data %>% 
+  select(Animal,Grupo,Region,Lacunarity) %>% 
+  summarySE(measurevar = "Lacunarity",
+            groupvars = c("Region","Grupo","Animal"))
+colnames(stats.r) <- c("Region","Grupo","Animal","N","Mean","sd","se","ci") 
+# table
+knitr::kable(stats.r, align = "c",digits = c(0,0,0,0,3,3,3,3))
+
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre a média de cada animal:\n")
+norm.and.var(stats.r, "Mean", region = TRUE)
+```
+
+**Testes estatísticos para as diferentes regiões**
+```{r animals-stats-r20, echo = FALSE, collapse = TRUE}
+# statistical test data
+# CA1
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "CA1")
+cat("\nCA1 ANOVA\n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+# CA3
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "CA3")
+cat("\nCA3 ANOVA \n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+
+# GD
+# Pairwise t-test
+stats.temp <- stats.r %>%
+  filter(Region == "GD")
+cat("\nGD ANOVA \n")
+anova(lm(Mean ~ Grupo, data = stats.temp)) #checking for general differences
+
+rm(stats.r,stats.temp)
+```
+
+#### Cells (N)
+**Hipocampo Inteiro**
+```{r cell-stats-h20, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células do hipocampo: \n")
+norm.and.var(data, "Lacunarity")
+```
+
+**Regiões**
+```{r cells-stats-r20, echo = FALSE, collapse = TRUE}
+# checking normality and variance
+cat("\nTeste de Normalidade e variância sobre todas as células de cada região: \n")
+norm.and.var(data, "Lacunarity", region = TRUE)
+```
+
+
+# Feature Selection
+
+## Significancia na diferença entre grupos
+
+Tabela com a significancia das diferenças na região do CA3 para os parametros analizados.
+
+| Parametro                  |  CS vs. AS   |    CS vs. AL    | AS vs. AL    |
+|:---------------------------|:------------:|:---------------:|:------------:|
+|Foreground pixels/Hull area |     x        | (p = 0.0499)*   | (p = 0.052)  |
+|Hull Area                   | (p = 0.014)\*| (p = 0.00004)***| x            |
+|Diameter of Bounding Circle | (p = 0.027)\*| (p = 0.002)**   | x            |
+|Mean Radius                 | (p = 0.031)\*| (p = 0.002)**   | x            |
+|Circularity                 |     x        | (p = 0.049)*    | (p = 0.055)  |
+|Hull void Area              | (p = 0.072)  | (p = 0.007)**   | x            |
+|Cell Area                   | x            | (p = 0.008)**   | x            |
+|Cell Perimeter              | x            | (p = 0.012)*    | x            |
+|Aspect Ratio                | (p = 0.005)**| x               | x            |
+|Solidity                    | x            | (p = 0.041)*    | x            |
+|Round                       | x            | x               | (p = 0.029)* |
+|Branches                    | x            | (p = 0.068)     | (p = 0.004)**|
+|Junctions                   | x            | (p = 0.061)     | (p = 0.006)**|
+|Triple Points               | x            | (p = 0.056)     | (p = 0.009)**|
+|Endpoints                   | x            | (p = 0.036)*    | x            |
+
+
+## Variance Score
+
+O *Variance Score* é representativo da diferença na variancia entre o grupo CS e os grupos AS e AL. O *score* segue a seguinte formula: 
+
+$$
+Score = |(\sigma^2_{CS}-\sigma^2_{AS})| + |(\sigma^2_{CS}-\sigma^2_{AL})|
+$$
+
+Aqui entenda $\sigma^2$ como a variancia e os dados utilizados em seu calculo são normalizados `scale(..., center = FALSE)` anteriormente, de modo a viabilizar a comparação entre os diferentes parametros sob a mesma escala.
+
+```{r variance-score, echo=FALSE}
+data <- data %>% select(-D.max)
+parametros <- colnames(data[,5:24])
+
+var.score <- tibble(Parametro = parametros[1],
+                    Score = variance.score(data,parametros[1]))
+# score dataframe
+for(i in 2:length(parametros)){
+  temp <- c(parametros[i],variance.score(data,parametros[i]))
+  var.score <- rbind(var.score,temp)
+  rm(temp)
+}
+
+# ordenar descendentemente 
+var.score <- arrange(var.score,desc(Score)) %>% 
+  mutate_at(.vars = "Score", as.numeric)
+
+knitr::kable(var.score, align = "c",digits = c(0,3))
+```
+
+
+## Correlation Matrix
+
+*Foram removidos da comparação da matriz de correlação os seguintes parametros: Quadruple points, Average branch length e Maximum branch length.*
+
+```{r correlation matrix,echo = FALSE}
+data.cor <- data %>% select(-Quadruple.points,-Average.branch.length,-Maximum.branch.length)
+
+
+corrplot(cor(data.cor[,5:21]), method = "color")
+
+rm(data.cor)
+```
+
+Podemos visualizar **2 modulos** correlacionados positivamente e 3 parametros individuais que se correlacionam negativamente com esse modulos.
+
+> **Modulo 1:** Hull Area, Diameter of Bounding Circle, Mean Radius, Cell Area, Cell Perimeter e Hull void area.
+
+*Esse modulo compreende principalmente parametros caracteristicos do tamanho da célula, com excessão do Hull Void Area que diz respeito mais a forma da célula com propriedades analogas a Foreground pixel/Hull Area e Solidity, mas inversamente proporcional*
+
+
+> **Modulo 2:** Branches, Junctions, Triple points e End point voxels.
+
+*Esse modulo compreende principalmente parametros caracteristicos da arborização/ramificação da célula*
+
+Dentre os **parametros individuais** anteriormente citados temos: Foreground Pixels/Hull Area, Solidity e Circularity. Parametros inversamente proporcionais aos modulos 1 e 2.
+
+Outro **parametro individual** que corresponde em certa medida a complexidade da célula é a Lacunaridade. Ela se apresenta correlacionada positivamente com os modulos 1 e 2. 
+
+Por fim temos Aspect Ratio, Round e D como parametros sem correlações significativas com os restantes dos parametros.
+
+## Multimodality Index (MMI)
+
+```{r}
+mmi_fun <- function(data){
+  ((skewness(data)^2)+1)/((kurtosis(data)+3*((length(data)-1)^2))/(length(data)-2)*(length(data)-3))
+}
+# rodar em cada coluna do data.frame data
+
+mmi <- apply(data[,5:24], MARGIN = 2, mmi_fun)
+
+knitr::kable(mmi, align = "c")
+```
+
+
+## Arranjos de grupos de parâmetros
+
+
+### Categorias {.tabset}
+
+#### **Essential** 
+
+| Negative Correlation        |  Cell Domain               |  Cell Ramification  | 
+|:---------------------------:|:--------------------------:|:-------------------:|
+|Solidity                     |Diameter of Bounding Circle |Junctions            |
+|Circularity                  |Mean Radius                 |Triple Points        |
+|Foreground Pixels / Hull area|Hull Area                   |Branches             |
+| -                           |Hull Void Area              |End points           |
+
+#### **Extras**
+
+| Uncorrelated Parameters   |  Cell Ramification |  Cell Size    | Porosity (?) |
+|:-------------------------:|:------------------:|:-------------:|:------------:|
+|Aspect Ratio               |Quadruple Points    |Cell Area      | Lacunarity   |
+|Round                      | -                  |Cell Perimeter | -            |
+|Dimensão Fractal (D)       | -                  | -             | -            |
+
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# crossing() em vetores de parâmetros em categorias pre arranjadas
+
+# essenciais
+negative.cor      <- c("Solidity","Circularity","Foreground.pixels.by.hull.area") # correlação negativa
+cell.domain       <- c("Diameter.of.Bounding.Circle",
+                       "Mean.Radius","Hull.Area","Hull.void.area")                # Cell Size/Domain
+cell.ramification <- c("Junctions","Triple.points","Branches","End.point.voxels") # Ramificação Skeleton
+
+# adicionais 
+extra.ramification <- c("Quadruple.points")            #ramificação
+extra.size         <- c("Cell.Area","Cell.Perimeter")  # Cell Size
+extra.porosity     <- c("Lacunarity")                  # porosidade
+extra.uncor        <- c("Aspect.Ratio","Round","D")    # não correlacionaveis 
+
+essential <- c(negative.cor,cell.domain,cell.ramification)
+#combinantions
+# 3 combination
+parameters.3 <- crossing(negative.cor,cell.domain,cell.ramification)
+
+# 4 combinations
+parameters.4.1 <- crossing(negative.cor,cell.domain,cell.ramification,extra.size) # + size
+parameters.4.2 <- crossing(negative.cor,cell.domain,cell.ramification,extra.porosity) # + porosity
+parameters.4.3 <- crossing(negative.cor,cell.domain,cell.ramification,extra.uncor) # + uncor
+
+# 5 combinations
+parameters.5.1 <- crossing(negative.cor,cell.domain,cell.ramification,extra.porosity, extra.size) # +p +s
+parameters.5.2 <- crossing(negative.cor,cell.domain,cell.ramification,extra.porosity,extra.uncor) # +p +u
+parameters.5.3 <- crossing(negative.cor,cell.domain,cell.ramification,extra.uncor, extra.size)    # +s +u
+
+parameters.5.4 <- crossing(negative.cor,cell.domain,extra.ramification, extra.size) 
+
+parameters.combination <- list(parameters.4.1,
+                               parameters.4.2,
+                               parameters.4.3,
+                               parameters.5.1,
+                               parameters.5.2,
+                               parameters.5.3)
+
+# cleaning variables
+rm(parameters.4.1,parameters.4.2,parameters.4.3,parameters.5.2, parameters.5.4,parameters.3)
+rm(negative.cor,cell.domain,cell.ramification,extra.porosity, extra.size,extra.uncor, essential,extra.ramification)
+
+```
+
+
+### Validation {.tabset}
+```{r parameter-testing, echo = FALSE, message = FALSE, warning = FALSE, include= FALSE}
+# verificar variancia explicada pelos componentes do PCA 
+# for(i in 1:6){
+#   pc.90(data,parameters.combination[[i]], threshold = 0.95)
+# }
+# parametros que passaram pelo thresholde de .95
+p <- parameters.combination[[1]][c(10,12,14,42,44,46,50,74,76,78,82),]
+
+#test de silhoutte para p // PC1 e PC2
+test.par <- val.sill(data,p, show.plot = TRUE, componentes = 1:2) # k = 2 (p[5,])// k = 3 (p[2,])
+
+
+#test de silhoutte para p // PC1 e PC2  para k = 4
+test.k4 <- val.sill(data,p, show.plot = TRUE, componentes = 1:2)
+
+#test all parameters from 4.1 (essential + size)
+test.par1 <- val.sill(data,parameters.combination[[1]],
+                     show.plot = TRUE, componentes = 1:4)
+
+# check for the higher silhoutte mean
+#test de silhoutte para parametros 5.1 e 5.3 // todos os componentes
+test5.1 <- val.sill(data,parameters.5.1, show.plot = TRUE, componentes = 1:5)
+test5.3 <- val.sill(data,parameters.5.3, show.plot = TRUE, componentes = 1:5)
+```
+
+#### k = 2 
+
+##### **Max Mean Sill: Essential + Cell Size (Threshold > .95)**
+
+```{r check-k2-1, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+# TEST.PAR (essential + size (threshold de .95))
+par.max.sill <- max.sill(test.par)
+par.max.sill$plot$k2[2]
+par.max.sill$plot$k2[1] # 2ª melhor
+```
+
+```{r check-k2-1-info, echo = FALSE, message = FALSE, warning = FALSE}
+par.max.sill$info$k2 # 2ª melhor
+```
+
+##### **Max Mean Sill: Essential + Cell Size**
+
+```{r check-k2-2, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p4.1 (essetnial + size)
+par1.max.sill <- max.sill(test.par1)
+par1.max.sill$plot$k2[2] # 1ª melhor
+par1.max.sill$plot$k2[1] # 1ª melhor
+```
+
+```{r check-k2-2-info, echo = FALSE, message = FALSE, warning = FALSE}
+par1.max.sill$info$k2 # 1ª melhor
+```
+
+##### **Max Mean Sill: Essential + Cell Size + Lacunarity**
+
+```{r check-k2-3, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p5.1 (essential + size + lacunarity)
+p5.1.max.sill <- max.sill(test5.1)
+p5.1.max.sill$plot$k2[2]
+p5.1.max.sill$plot$k2[1]
+```
+
+```{r check-k2-3-info, echo = FALSE, message = FALSE, warning = FALSE}
+p5.1.max.sill$info$k2
+```
+
+##### **Max Mean Sill: Essential + Cell Size + Uncorrelated**
+
+```{r check-k2-4, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p5.3 (essential + size + uncor)
+p5.3.max.sill <- max.sill(test5.3)
+p5.3.max.sill$plot$k2[2]
+p5.3.max.sill$plot$k2[1]
+```
+
+```{r check-k2-4-info, echo = FALSE, message = FALSE, warning = FALSE}
+p5.3.max.sill$info$k2
+```
+
+#### k = 3 
+
+##### **Max Mean Sill: Essential + Cell Size (Threshold > .95)**
+
+```{r check-k3-1, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+# TEST.PAR (essential + size (threshold de .95))
+par.max.sill$plot$k3[2] # melhor!
+par.max.sill$plot$k3[1] # melhor!
+```
+
+```{r check-k3-1-info, echo = FALSE, message = FALSE, warning = FALSE}
+par.max.sill$info$k3 # melhor!
+```
+
+
+```{r check-k3-1-neg, echo = FALSE, message = FALSE, warning = FALSE}
+p.k3 <- unlist(p[par.max.sill$id$k3,], use.names = FALSE)
+pca.k3 <- prcomp(data[p.k3], center = TRUE, scale = TRUE)
+x.k3 <- pca.k3$x[,1:2]
+clust.k3 <- hclust(dist(x.k3,method = "euclidian"), method = "ward.D2")
+sill.k3 <- silhouette(cutree(clust.k3, k= 3), dist(x.k3,method = "euclidian"))
+k3.neg.id <- which(sill.k3[,3] < 0)
+
+cat("Negative Silhoutte Coeficiente Cells \n")
+table(data[k3.neg.id,]$Grupo)
+table(data[k3.neg.id,]$Animal)
+
+rm(p.k3,pca.k3,x.k3,sill.k3,k3.neg.id)
+```
+
+
+##### **Max Mean Sill: Essential + Cell Size**
+
+```{r check-k3-2, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p4.1 (essetnial + size)
+par1.max.sill$plot$k3[2]
+par1.max.sill$plot$k3[1]
+```
+
+```{r check-k3-2-info, echo = FALSE, message = FALSE, warning = FALSE}
+par1.max.sill$info$k3
+```
+
+##### **Max Mean Sill: Essential + Cell Size + Lacunarity**
+
+```{r check-k3-3, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p5.1 (essential + size + lacunarity)
+p5.1.max.sill$plot$k3[2]
+p5.1.max.sill$plot$k3[1]
+```
+
+```{r check-k3-3-info, echo = FALSE, message = FALSE, warning = FALSE}
+p5.1.max.sill$info$k3
+```
+
+##### **Max Mean Sill: Essential + Cell Size + Uncorrelated**
+
+```{r check-k3-4, echo = FALSE, message = FALSE, results = FALSE, fig.show= "hold", out.width = "50%"}
+#p5.3 (essential + size + uncor)
+p5.3.max.sill$plot$k3[2]
+p5.3.max.sill$plot$k3[1]
+```
+
+```{r check-k3-4-info, echo = FALSE, message = FALSE, warning = FALSE}
+p5.3.max.sill$info$k3
+```
+
+# Optimum Clusterization 
+
+```{r optimum-clust, echo = FALSE, message = FALSE, warning = FALSE}
+# pegar melhor k=2 (test.par1 - parameter.combination[[1]]) & k=3 (test.par - p) 
+# k = 2
+p.k2 <- unlist(parameters.combination[[1]][par1.max.sill$id$k2,], use.names = FALSE)
+# k = 3
+p.k3 <- unlist(p[par.max.sill$id$k3,], use.names = FALSE)
+  
+# k = 2
+pca.k2 <- prcomp(data[p.k2], center = TRUE, scale = TRUE)
+x.k2 <- pca.k2$x[,1:2]
+clust.k2 <- hclust(dist(x.k2,method = "euclidian"), method = "ward.D2")
+cid.k2 <- as.factor(cutree(clust.k2,k=2))
+
+sill.k2 <- silhouette(cutree(clust.k2, k= 2), dist(x.k2,method = "euclidian"))
+# fviz_silhouette(sill.k2, palette = c("#0072B2","#CC6666","#66CC99"))+
+#                 theme(plot.title = element_text(hjust = 0.5))
+# check which cells have negative silhoutte
+k2.neg.id <- which(sill.k2[,3] < 0)
+# table(data[k2.neg.id,]$Grupo)
+
+# k = 3
+pca.k3 <- prcomp(data[p.k3], center = TRUE, scale = TRUE)
+x.k3 <- pca.k3$x[,1:2]
+clust.k3 <- hclust(dist(x.k3,method = "euclidian"), method = "ward.D2")
+cid.k3 <- as.factor(cutree(clust.k3,k=3))
+
+sill.k3 <- silhouette(cutree(clust.k3, k= 3), dist(x.k3,method = "euclidian"))
+# fviz_silhouette(sill.k3, palette = c("#0072B2","#CC6666","#66CC99"))+
+#                 theme(plot.title = element_text(hjust = 0.5))
+# check which cells have negative silhoutte
+k3.neg.id <- which(sill.k3[,3] < 0)
+```
+
+```{r clust-dend-k3, echo = FALSE, message = FALSE, warning = FALSE}
+title <- "Dendrogram with k = 3 (Ward.D2 Method)"
+
+dend <- clust.k3 %>%  
+  as.dendrogram() %>% set("labels", NULL)
+
+colbranches <- function(n, col){
+  a <- attributes(n) # Find the attributes of current node
+  # Color edges with requested color
+  attr(n, "edgePar") <- c(a$edgePar, list(col=col, lwd=2))
+  n # Don't forget to return the node!
+  }
+
+test <- dend
+
+test[[1]] = dendrapply(test[[1]], colbranches, "#66CC99")
+test[[2]][[1]] = dendrapply(test[[2]][[1]], colbranches, "#CC6666")
+test[[2]][[2]] = dendrapply(test[[2]][[2]], colbranches, "#0072B2")
+
+#plot(dend, main = title)
+plot(test, main = title, type = "rectangle") + abline(h = 50, lty = 2)
+
+rm(test,cor,title)
+```
+
+```{r clust-dend-k2, echo = FALSE, message = FALSE, warning = FALSE}
+title <- "Dendograma k = 2 (Método = Ward.D2)"
+
+dend <- clust.k2 %>%  
+  as.dendrogram() %>% set("labels", NULL)
+
+test <- dend
+
+test[[1]] = dendrapply(test[[1]], colbranches, "#66CC99")
+test[[2]] = dendrapply(test[[2]], colbranches, "#CC6666")
+#test[[2]][[2]] = dendrapply(test[[2]][[2]], colbranches, "#0072B2")
+
+
+plot(test, main = title, type = "rectangle")
+abline(h = 75, lty = 2)
+
+rm(test,cor,title)
+```
+
+```{r sum-clust, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+# cid.k2 & cid.k3
+# calculate de sum of cluster id per experimental grups
+cluster.id.k2 <- cbind(data[1:4], cluster = cid.k2)
+cluster.id.k2 <- cluster.id.k2 %>% 
+  group_by(Region,Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+
+cluster.id.k3 <- cbind(data[1:4], cluster = cid.k3)
+cluster.id.k3 <- cluster.id.k3 %>% 
+  group_by(Region,Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+
+h.cluster.id.k3 <- cbind(data[1:4], cluster = cid.k3)
+h.cluster.id.k3 <- h.cluster.id.k3 %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+
+# filter negative sill coeficiente 
+f.cluster.id.k3 <- cbind(data[1:4][-k3.neg.id,], cluster = cid.k3[-k3.neg.id])
+hf.cluster.id.k3 <- f.cluster.id.k3 %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+rf.cluster.id.k3 <- f.cluster.id.k3 %>% 
+  group_by(Region,Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+```
+
+## **Gráficos** {.tabset}
+
+### Box plot {.tabset}
+
+Soma do numero de células por região e animal
+
+#### k = 2
+
+```{r box-plot-k2, echo = FALSE, message = FALSE, warning = FALSE}
+cluster.id.k2 %>% 
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "Hipocampo Inteiro")
+
+cluster.id.k2 %>% 
+  filter(Region == "CA3") %>% 
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "CA3")
+
+```
+
+
+
+#### k = 3
+
+```{r box-plot-k3-1, echo = FALSE, message = FALSE, fig.show= "hold", out.width = "50%"}
+h.cluster.id.k3 %>%
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "Hipocampo Inteiro")
+
+hf.cluster.id.k3 %>%
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "Hipocampo Inteiro (filtrado)")
+```
+
+
+```{r box-plot-k3-2, echo = FALSE, message = FALSE, warning = FALSE, fig.show= "hold", out.width = "50%"}
+cluster.id.k3 %>%
+  filter(Region == "CA3") %>%
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "CA3")
+
+rf.cluster.id.k3 %>%
+  filter(Region == "CA3") %>%
+  ggplot(aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+  geom_boxplot(alpha = 0.5) + ggtitle(label= "CA3 (filtrado)")
+
+rm(f.cluster.id.k3,cluster.id.k2,sill.k3,pca.k2,clust.k2,cid.k2,
+   clust.k3,sill.k3)
+```
+
+### Bar plot
+
+Média da soma do numero de células por região e animal
+
+```{r bar-plot-h, echo = FALSE, message = FALSE, warning = FALSE, fig.show= "hold", out.width = "50%"}
+# média do numero de cluster por animal para plotar em barra
+# moving AL to left
+# hipocampo
+h.med.k3 <- h.cluster.id.k3 %>% 
+  summarySE(measurevar = "Number.per.cluster",
+            groupvars = c("Grupo","cluster"))
+
+hf.med.k3 <- hf.cluster.id.k3 %>% 
+  summarySE(measurevar = "Number.per.cluster",
+            groupvars = c("Grupo","cluster"))
+
+ggplot(h.med.k3,aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+    geom_col(position=position_dodge(.9), colour="black", stat="identity")+
+    theme_bw() + geom_errorbar(aes(ymin = Number.per.cluster-se ,
+                                   ymax = Number.per.cluster+se),
+                               width = .2,position = position_dodge(0.9)) +
+  ggtitle(label= "Hipocampo inteiro")
+
+ggplot(hf.med.k3,aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+    geom_col(position=position_dodge(.9), colour="black", stat="identity")+
+    theme_bw() + geom_errorbar(aes(ymin = Number.per.cluster-se ,
+                                   ymax = Number.per.cluster+se),
+                               width = .2,position = position_dodge(0.9)) +
+  ggtitle(label= "Hipocampo inteiro (filtrado)")
+```
+
+
+```{r bar-plot-r, echo = FALSE, message = FALSE, warning = FALSE}
+#regions
+r.med.k3 <- cluster.id.k3 %>% 
+  summarySE(measurevar = "Number.per.cluster",
+            groupvars = c("Region","Grupo","cluster"))
+
+rf.med.k3 <- rf.cluster.id.k3 %>% 
+  summarySE(measurevar = "Number.per.cluster",
+            groupvars = c("Region","Grupo","cluster"))
+
+ggplot(r.med.k3,aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+    geom_col(position=position_dodge(.9), colour="black", stat="identity")+
+    theme_bw() + geom_errorbar(aes(ymin = Number.per.cluster-se ,
+                                   ymax = Number.per.cluster+se),
+                               width = .2,position = position_dodge(0.9))+
+  facet_wrap(~Region) + ggtitle(label= "Regiões")
+
+ggplot(rf.med.k3,aes(x = Grupo, y = Number.per.cluster, fill = cluster)) +
+    geom_col(position=position_dodge(.9), colour="black", stat="identity")+
+    theme_bw() + geom_errorbar(aes(ymin = Number.per.cluster-se ,
+                                   ymax = Number.per.cluster+se),
+                               width = .2,position = position_dodge(0.9))+
+  facet_wrap(~Region) + ggtitle(label= "Regiões (filtrado)")
+```
+
+
+## **Estatística** {.tabset}
+
+```{r data-setup, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+#estatistica
+stat.var.norm <- function(data){
+  # variancia
+   eqvar <- leveneTest(data$Number.per.cluster ~ data$Grupo)
+  # normalidade
+   norm.cs <- shapiro.test(data$Number.per.cluster[which(data$Grupo == "CS")]) 
+   norm.as <- shapiro.test(data$Number.per.cluster[which(data$Grupo == "AS")]) 
+   norm.al <- shapiro.test(data$Number.per.cluster[which(data$Grupo == "AL")]) 
+  
+   output <- list(Equal.Variance = eqvar, Normality = list(CS = norm.cs,
+                                                           AS = norm.as,
+                                                           AL = norm.al))
+   return(output)
+}
+
+# arranging data
+#hipocampo
+hip.k3 <- cbind(data[1:4], cluster = cid.k3)
+hip.k3 <- hip.k3 %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+#filtered
+f.hip.k3 <- cbind(data[1:4][-k3.neg.id,], cluster = cid.k3[-k3.neg.id])
+f.hip.k3 <- f.hip.k3 %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+
+# CA3 
+ca3.k3 <- cluster.id.k3 %>%
+  filter(Region == "CA3")
+ca3.k3 <- ca3.k3 %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+#filtered
+f.ca3.k3 <- cbind(data[1:4][-k3.neg.id,], cluster = cid.k3[-k3.neg.id])
+f.ca3.k3 <- f.ca3.k3 %>% filter(Region == "CA3") %>% 
+  group_by(Animal,Grupo,cluster) %>% 
+  dplyr::summarise(Number.per.cluster = n())
+```
+
+### Hipocampo Normality & Variance
+
+```{r data-checking-h, echo = FALSE, message = FALSE, warning = FALSE}
+# check variance and normality
+#hipocampo
+
+cat("Não Filtrado!\n")
+
+stat.var.norm(hip.k3)   # OK!
+
+cat("Filtrado!\n")
+
+stat.var.norm(f.hip.k3) # OK!
+```
+
+### CA3 Normality & Variance
+
+```{r data-checking-r, echo = FALSE, message = FALSE, warning = FALSE}
+#CA3
+
+cat("Não Filtrado!\n")
+
+
+stat.var.norm(ca3.k3)   # não passou na normalidade de AL
+
+cat("Filtrado!\n")
+
+stat.var.norm(f.ca3.k3) # OK!
+
+```
+
+### Testes estatísticos {.tabset .tabset-pills}
+
+```{r estatistica-cluster-function, echo = FALSE, message = FALSE, warning = FALSE}
+# ANOVA com Tukey Honest Significant Differences
+stat <- function(data,option, mode = 1, wilcoxon = FALSE){
+  if(mode == 1 & wilcoxon == TRUE){
+  temp   <- data %>% filter(cluster == option)
+  result <- pairwise.wilcox.test(temp$Number.per.cluster, temp$Grupo, p.adjust.method = "none")
+  return(result)
+  }
+  else if(mode == 2 & wilcoxon == TRUE){
+  temp   <- data %>% filter(Grupo == option)
+  result <- pairwise.wilcox.test(temp$Number.per.cluster, temp$cluster, p.adjust.method = "none")
+  return(result)
+  }
+  else if(mode == 1){
+  temp <- data %>% filter(cluster == option)
+  anova <- aov(temp$Number.per.cluster ~ temp$Grupo)
+  return(TukeyHSD(anova))
+  }
+  else if(mode == 2){
+  temp <- data %>% filter(Grupo == option)
+  anova <- aov(temp$Number.per.cluster ~ temp$cluster)
+  return(TukeyHSD(anova))
+  }
+}
+```
+
+
+#### Intra cluster & Inter groups 
+
+##### **Hipocampo** {.tabset .tabset-pills}
+
+###### Cluster 1
+
+```{r estatistica-cluster-hipocampo-1-c1, echo = FALSE, message = FALSE, warning = FALSE}
+# intra cluster & inter grupo
+# c1
+stat(hip.k3,1)
+stat(f.hip.k3,1)
+```
+
+###### Cluster 2
+
+```{r estatistica-cluster-hipocampo-1-c2, echo = FALSE, message = FALSE, warning = FALSE}
+# c2
+stat(hip.k3,2)
+stat(f.hip.k3,2)
+```
+
+###### Cluster 3
+
+```{r estatistica-cluster-hipocampo-1-c3, echo = FALSE, message = FALSE, warning = FALSE}
+# c3
+stat(hip.k3,3)
+stat(f.hip.k3,3)
+```
+
+##### **CA3** {.tabset .tabset-pills}
+
+###### Cluster 1
+
+```{r estatistica-cluster-ca3-1-c1, echo = FALSE, message = FALSE, warning = FALSE}
+# intra cluster & inter grupo
+# c1
+stat(ca3.k3,1)
+stat(f.ca3.k3,1)
+```
+
+###### Cluster 2
+
+```{r estatistica-cluster-ca3-1-c2, echo = FALSE, message = FALSE, warning = FALSE}
+# c2
+stat(ca3.k3,2)
+stat(f.ca3.k3,2)
+```
+
+###### Cluster 3
+
+```{r estatistica-cluster-ca3-1-c3, echo = FALSE, message = FALSE, warning = FALSE}
+# c3
+stat(ca3.k3,2, wilcoxon = TRUE)
+stat(f.ca3.k3,3, wilcoxon = TRUE)
+
+
+```
+
+#### Intra groups & Inter clusters 
+
+##### **Hipocampo** {.tabset .tabset-pills}
+
+###### CS
+
+```{r estatistica-cluster-hipocampo-2-cs, echo = FALSE, message = FALSE, warning = FALSE}
+# intra grupo & inter cluster
+# CS
+stat(hip.k3,"CS",2)
+stat(f.hip.k3,"CS",2)
+```
+
+###### AS
+
+```{r estatistica-cluster-hipocampo-2-as, echo = FALSE, message = FALSE, warning = FALSE}
+# AS
+stat(hip.k3,"AS",2)
+stat(f.hip.k3,"AS",2)
+```
+
+###### AL
+
+```{r estatistica-cluster-hipocampo-2-al, echo = FALSE, message = FALSE, warning = FALSE}
+# AL
+stat(hip.k3,"AL",2)
+stat(f.hip.k3,"AL",2)
+
+```
+
+##### **CA3** {.tabset .tabset-pills}
+
+###### CS
+
+```{r estatistica-cluster-ca3-2-cs, echo = FALSE, message = FALSE, warning = FALSE}
+# intra grupo & inter cluster
+# CS
+stat(ca3.k3,"CS",2)
+stat(f.ca3.k3,"CS",2)
+```
+
+###### AS
+
+```{r estatistica-cluster-ca3-2-as, echo = FALSE, message = FALSE, warning = FALSE}
+# AS
+stat(ca3.k3,"AS",2)
+stat(f.ca3.k3,"AS",2)
+```
+
+###### AL
+
+```{r estatistica-cluster-ca3-2-al, echo = FALSE, message = FALSE, warning = FALSE}
+# AL
+stat(ca3.k3,"AL", mode = 2, wilcoxon = TRUE)
+stat(f.ca3.k3,"AL",2)
+
+```
+
+
+## Scatter Plot
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# VISUALIZAR EM PCA A DISTRIBUIÇÃO
+# - realizar o calculo das distancias manhatam e euclidiana
+
+# - verificar qualidade da clusterização (sillhuete coeficient)
+# - visualização da clusterização apenas em CA3 // verificar sillhuete dessse segmento de grupo
+# - avaliar impacto das diferenças nas variancias na distribuição do PCA entre os grupos experimentais
+
+# scatter plot por grupo experimental & CA3 & highlight sill negativo
+pca.k3 <- prcomp(data[p.k3], center = TRUE, scale = TRUE)
+x.k3 <- pca.k3$x[,1:2]
+
+negative.sill <- vector(length = 2160)
+negative.sill[k3.neg.id] = TRUE
+negative.sill[-k3.neg.id] = FALSE
+
+x.k3 <- tibble(Regiao = data$Region, Grupo = data$Grupo, PC1 = x.k3[,1], PC2 = x.k3[,2],
+               negative.sill = negative.sill) 
+
+as.data.frame(x.k3) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = as.factor(negative.sill))) +
+  geom_point(alpha = 0.5) + scale_color_manual(name="Sill Coeficiente",
+                             values=c("gray","black")) +
+  facet_grid(Regiao~Grupo)
+
+
+# centroid
+
+
+```
+
+
+
+
+
+
+
+
+
+
